@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Driver for the signet Loop lab. See README.md for the bootstrap order.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+COMPOSE="docker compose"
+LITD=loop-lab-litd
+BITCOIND=loop-lab-bitcoind
+
+# Loop's signet swap server node, read from a LoopOutQuote swap_payment_dest.
+SIGNET_LOOP_SERVER_NODE=020b7dabb53ac802074efc8daa96e64fb51058435ccf675c9520438e446b5e2257
+
+lncli()   { docker exec -i $LITD lncli --network signet --lnddir /data/.lnd --rpcserver localhost:10009 "$@"; }
+loop()    { docker exec -i $LITD loop --network signet --rpcserver localhost:8443 --tlspathlnd /data/.lnd/tls.cert "$@"; }
+bitcoin() { docker exec -i $BITCOIND bitcoin-cli -signet -rpcuser=lightning -rpcpassword=lightning "$@"; }
+
+usage() {
+  cat <<'EOF'
+usage: ./loop-lab <command>
+
+  up                    start bitcoind + litd
+  down                  stop, keep volumes
+  nuke                  stop and delete volumes
+  logs [svc]            follow logs
+  sync                  bitcoind and lnd sync progress
+  info                  node pubkey, peers, channels, balances
+
+  addr                  new on-chain address to fund from a signet faucet
+  open-channel <sat>    open a channel to the Loop signet swap server
+  inbound <sat>         loop out to convert outbound into inbound liquidity
+
+  quotes [network]      live server limits and fees (no node needed)
+  terms                 loop in/out terms as this node sees them
+
+  static-new            create a reusable static loop-in address
+  static-deposits       list deposits sitting at the static address
+  static-in             swap all confirmed deposits to Lightning
+  in-external <sat>     one-off loop-in address for a third party to pay
+
+  restart-test          restart litd and re-check loop state survived
+EOF
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  up)    $COMPOSE up -d; echo "started. watch with: ./loop-lab sync" ;;
+  down)  $COMPOSE down ;;
+  nuke)  $COMPOSE down --volumes ;;
+  logs)  $COMPOSE logs -f "${1:-}" ;;
+
+  sync)
+    echo "--- bitcoind ---"
+    bitcoin getblockchaininfo | jq -r '"blocks \(.blocks)/\(.headers)  progress \(.verificationprogress*100|floor)%"' || true
+    echo "--- lnd ---"
+    lncli getinfo 2>/dev/null | jq -r '"height \(.block_height)  synced_chain \(.synced_to_chain)  synced_graph \(.synced_to_graph)"' \
+      || echo "lnd not answering yet"
+    ;;
+
+  info)
+    lncli getinfo | jq -c '{pubkey:.identity_pubkey, height:.block_height, synced:.synced_to_chain, peers:.num_peers, active:.num_active_channels, pending:.num_pending_channels}'
+    echo "--- on-chain ---"; lncli walletbalance | jq -c '{confirmed:.confirmed_balance, unconfirmed:.unconfirmed_balance}'
+    echo "--- channels ---"; lncli channelbalance | jq -c '{local:.local_balance.sat, remote:.remote_balance.sat}'
+    ;;
+
+  addr) lncli newaddress p2tr | jq -r .address ;;
+
+  open-channel)
+    amt=${1:?need an amount in sats}
+    lncli connect "$SIGNET_LOOP_SERVER_NODE@signet.swap.lightning.today:9735" 2>/dev/null || true
+    lncli openchannel --node_key "$SIGNET_LOOP_SERVER_NODE" --local_amt "$amt"
+    ;;
+
+  inbound)
+    amt=${1:?need an amount in sats}
+    echo "loop out $amt to turn outbound into inbound. --fast skips the 30min batch wait."
+    loop out --amt "$amt" --fast
+    ;;
+
+  quotes) ./quote.sh "${1:-signet}" ;;
+
+  terms)
+    echo "--- loop in ---";  loop terms in  || loop terms
+    echo "--- loop out ---"; loop terms out || true
+    ;;
+
+  static-new)       loop static new ;;
+  static-deposits)  loop static listdeposits ;;
+  static-in)        loop static in --all ;;
+  in-external)      loop in --amt "${1:?need an amount in sats}" --external ;;
+
+  restart-test)
+    echo "--- before ---"
+    loop listauth || true
+    loop static listdeposits || true
+    docker restart $LITD >/dev/null
+    echo "restarted, waiting for litd"
+    for _ in $(seq 1 60); do lncli getinfo >/dev/null 2>&1 && break; sleep 2; done
+    echo "--- after ---"
+    loop listauth || true
+    loop static listdeposits || true
+    echo
+    echo "l402 token and deposits must both still be here. If not, loop.loopdir is not landing on the volume."
+    ;;
+
+  *) usage; exit 2 ;;
+esac

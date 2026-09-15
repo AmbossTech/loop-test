@@ -1,0 +1,48 @@
+name: loop-lab
+
+services:
+  bitcoind:
+    # lightninglabs/bitcoin-core publishes amd64 only; this one is multi-arch.
+    image: bitcoin/bitcoin:29.0
+    container_name: loop-lab-bitcoind
+    restart: unless-stopped
+    networks: [loop-lab]
+    volumes:
+      - bitcoind:/home/bitcoin/.bitcoin
+    command:
+      - "bitcoind"
+      - "-signet"
+      - "-server"
+      - "-txindex"
+      - "-printtoconsole"
+      - "-rpcport=38332"
+      - "-rpcbind=0.0.0.0"
+      - "-rpcallowip=0.0.0.0/0"
+      # hashed "lightning" with a salt, same pair the upstream loop regtest uses
+      - "-rpcauth=lightning:8492220e715bbfdf5f165102bfd7ed4$$88090545821ed5e9db614588c0afbad575ccc14681fb77f3cae6899bc419af67"
+      - "-zmqpubrawblock=tcp://0.0.0.0:28332"
+      - "-zmqpubrawtx=tcp://0.0.0.0:28333"
+      - "-fallbackfee=0.0002"
+
+  litd:
+    image: lightninglabs/lightning-terminal:v0.17.0-alpha
+    container_name: loop-lab-litd
+    restart: unless-stopped
+    networks: [loop-lab]
+    depends_on: [bitcoind]
+    volumes:
+      - litd:/data
+      - ./conf/lit.conf:/data/.lit/lit.conf:ro
+    ports:
+      - "10009:10009"
+      - "8443:8443"
+    command:
+      - "litd"
+      - "--configfile=/data/.lit/lit.conf"
+
+networks:
+  loop-lab:
+
+volumes:
+  bitcoind:
+  litd:

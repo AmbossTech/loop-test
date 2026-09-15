@@ -1,0 +1,3 @@
+.protos/
+findings/*.local.*
+.DS_Store
